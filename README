@@ -1,0 +1,17 @@
+
+conda env create --name envname --file=environments.yml
+
+How to execute:
+python stamp_states_on_video.py
+--video of_video_to_be_analyzed.mp4
+--states result_file_from_moseq.csv
+--column name_of_the_column_to_be_stamped_on_video
+--out new_video.mp4
+
+
+Usage example:
+python stamp_states_on_video.py
+--video "/Users/chen/Library/CloudStorage/GoogleDrive-schen601@usc.edu/My Drive/moseq_proj/data/videos/test/sc04_d3_10mintest.mp4"
+--states "/Users/chen/Library/CloudStorage/GoogleDrive-schen601@usc.edu/My Drive/moseq_proj/2025_12_23-00_08_36/results/1.csv"
+--column syllable_merged_label
+--out "/Users/chen/Library/CloudStorage/GoogleDrive-schen601@usc.edu/My Drive/moseq_proj/data/videos/test/annotated_sc04_d3_10mintest.mp4"
