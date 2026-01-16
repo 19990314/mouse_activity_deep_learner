@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from collections import Counter
 from scipy.io import loadmat
-from evaluate_annotation import *
+from acc_annotation import *
 
 merged_labels = {
     0: "turn",

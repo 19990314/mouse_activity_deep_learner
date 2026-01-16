@@ -68,6 +68,20 @@ def load_dlc_csv(dlc_csv_path: str) -> pd.DataFrame:
         df = df.drop(columns=df.columns[0])
     return df
 
+def load_dlc_h5(path):
+    """
+    Load DeepLabCut .h5 output as pandas DataFrame.
+    Columns are a MultiIndex: (scorer, bodypart, coord).
+    """
+    df = pd.read_hdf(path)
+
+    # Some DLC versions include an index level name; normalize if needed
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("DLC .h5 did not load with MultiIndex columns.")
+
+    return df
+
+
 def interpolate_low_conf(xy: np.ndarray, conf: np.ndarray, thr: float = 0.6) -> np.ndarray:
     out = xy.copy().astype(np.float32)
     out[conf < thr] = np.nan
@@ -249,7 +263,7 @@ def temporal_tv_penalty(logits, weight=0.02):
 # ----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dlc_csv", required=True)
+    ap.add_argument("--dlc_h5", required=True)
     ap.add_argument("--ann_csv", required=True)
     ap.add_argument("--combined_mat", required=True)
     ap.add_argument("--session_prefix", default="sc04_d1_of")
@@ -257,26 +271,26 @@ def main():
     ap.add_argument("--out_ckpt", required=True)
 
     ap.add_argument("--dlc_conf_thr", type=float, default=0.6)
-    ap.add_argument("--smooth_label_win", type=int, default=7)
+    ap.add_argument("--smooth_label_win", type=int, default=9)
 
-    ap.add_argument("--seq_len", type=int, default=256)
-    ap.add_argument("--stride", type=int, default=128)
+    ap.add_argument("--seq_len", type=int, default=384)
+    ap.add_argument("--stride", type=int, default=192)
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--epochs", type=int, default=500)
     ap.add_argument("--lr", type=float, default=2e-4)
 
     ap.add_argument("--channels", type=int, default=128)
     ap.add_argument("--levels", type=int, default=8)
     ap.add_argument("--kernel_size", type=int, default=5)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--tv_weight", type=float, default=0.02)
+    ap.add_argument("--tv_weight", type=float, default=0.04)
 
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Device] {device}")
 
-    dlc_df = load_dlc_csv(args.dlc_csv)
+    dlc_df = load_dlc_h5(args.dlc_h5)
     ann_df = pd.read_csv(args.ann_csv)
 
     speed, w, fps, mat_name = load_kinematics_from_combined_mat(args.combined_mat, args.session_prefix)
@@ -347,7 +361,7 @@ def main():
             scaler.update()
 
         val_loss = eval_val()
-        print(f"epoch {ep:02d} | val_loss={val_loss:.4f}")
+        print(f"epoch {ep:02d} | val_loss=8{val_loss:.4f}")
 
         # Save best checkpoint
         if val_loss < best:
@@ -355,7 +369,7 @@ def main():
             ckpt = {
                 "state_dict": model.state_dict(),
                 "in_features": int(X.shape[1]),
-                "channels": int(args.channels), 
+                "channels": int(args.channels),
                 "levels": int(args.levels),
                 "kernel_size": int(args.kernel_size),
                 "dropout": float(args.dropout),

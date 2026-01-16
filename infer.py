@@ -82,6 +82,20 @@ def load_dlc_csv(path):
         df = df.drop(columns=df.columns[0])
     return df
 
+
+def load_dlc_h5(path):
+    """
+    Load DeepLabCut .h5 output as pandas DataFrame.
+    Columns are a MultiIndex: (scorer, bodypart, coord).
+    """
+    df = pd.read_hdf(path)
+
+    # Some DLC versions include an index level name; normalize if needed
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("DLC .h5 did not load with MultiIndex columns.")
+
+    return df
+
 def interpolate_low_conf(xy, conf, thr=0.6):
     out = xy.astype(np.float32).copy()
     out[conf < thr] = np.nan
@@ -188,45 +202,75 @@ def viterbi(logp, switch_penalty=2.5):
         path[t] = back[t+1, path[t+1]]
     return path
 
-def enforce_min_duration(states, min_len):
+def enforce_min_duration(states, min_len_by_class):
     s = states.copy()
+    T = len(s)
     i = 0
-    while i < len(s):
+    while i < T:
         j = i + 1
-        while j < len(s) and s[j] == s[i]:
+        while j < T and s[j] == s[i]:
             j += 1
-        if j - i < min_len.get(s[i], 1):
-            if i > 0:
-                s[i:j] = s[i-1]
+
+        cls = int(s[i])
+        bout_len = j - i
+        min_len = min_len_by_class.get(cls, 1)
+
+        if bout_len < min_len:
+            # Merge into neighbor
+            left = s[i - 1] if i > 0 else None
+            right = s[j] if j < T else None
+
+            if left is not None:
+                s[i:j] = left
+            elif right is not None:
+                s[i:j] = right
+
         i = j
     return s
+
 
 # ============================================================
 # Main
 # ============================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dlc_csv", required=True)
+    ap.add_argument("--dlc_h5", required=True)
     ap.add_argument("--ann_csv", required=True)
     ap.add_argument("--combined_mat", required=True)
-    ap.add_argument("--session_prefix", default="sc04_d1_of")
+    ap.add_argument("--session_prefix", default="sc04_d3_of")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--out_csv", required=True)
-    ap.add_argument("--switch_penalty", type=float, default=2.5)
+    ap.add_argument("--switch_penalty", type=float, default=3.5)
+    ap.add_argument("--min_turn", type=int, default=6)
+    ap.add_argument("--min_forward", type=int, default=8)
+    ap.add_argument("--min_still", type=int, default=15)
+    ap.add_argument("--min_explore", type=int, default=15)
+    ap.add_argument("--min_rear", type=int, default=8)
+    ap.add_argument("--min_groom", type=int, default=12)
+
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load data
-    dlc_df = load_dlc_csv(args.dlc_csv)
+    dlc_df = load_dlc_h5(args.dlc_h5)
     ann_df = pd.read_csv(args.ann_csv)
     speed, angvel = load_kinematics(args.combined_mat, args.session_prefix)
+
+    MIN_BOUT_LEN = {
+        0: args.min_turn,
+        1: args.min_forward,
+        2: args.min_still,
+        3: args.min_explore,
+        4: args.min_rear,
+        5: args.min_groom,
+    }
 
     # Build features
     X, T = build_features(dlc_df, ann_df, speed, angvel)
 
     # Load checkpoint
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = TCN(
         in_features=ckpt["in_features"],
         channels=ckpt["channels"],
@@ -249,16 +293,19 @@ def main():
     pred_vit = viterbi(logp, args.switch_penalty)
     pred_final = enforce_min_duration(
         pred_vit,
-        {0:3, 1:3, 2:5, 3:5, 4:5, 5:8}
+        MIN_BOUT_LEN
     )
 
     # Output
     out = ann_df.iloc[:T].copy()
     out["tcn_pred"] = pred_raw
     out["tcn_pred_label"] = out["tcn_pred"].map(STATE_MAP)
+
+    out["tcn_viterbi"] = pred_vit
+    out["tcn_viterbi_label"] = out["tcn_viterbi"].map(STATE_MAP)
+
     out["tcn_final"] = pred_final
     out["tcn_final_label"] = out["tcn_final"].map(STATE_MAP)
-    out.to_csv(args.out_csv, index=False)
 
     print(f"[OK] saved {args.out_csv}")
 

@@ -78,6 +78,20 @@ def load_dlc_csv(dlc_csv_path: str) -> pd.DataFrame:
         df = df.drop(columns=df.columns[0])
     return df
 
+def load_dlc_h5(path):
+    """
+    Load DeepLabCut .h5 output as pandas DataFrame.
+    Columns are a MultiIndex: (scorer, bodypart, coord).
+    """
+    df = pd.read_hdf(path)
+
+    # Some DLC versions include an index level name; normalize if needed
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("DLC .h5 did not load with MultiIndex columns.")
+
+    return df
+
+
 def load_annotations_csv(ann_csv_path: str) -> pd.DataFrame:
     return pd.read_csv(ann_csv_path)
 
