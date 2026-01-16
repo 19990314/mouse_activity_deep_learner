@@ -276,7 +276,7 @@ def main():
     ap.add_argument("--seq_len", type=int, default=384)
     ap.add_argument("--stride", type=int, default=192)
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--epochs", type=int, default=500)
+    ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--lr", type=float, default=2e-4)
 
     ap.add_argument("--channels", type=int, default=128)
@@ -361,7 +361,7 @@ def main():
             scaler.update()
 
         val_loss = eval_val()
-        print(f"epoch {ep:02d} | val_loss=8{val_loss:.4f}")
+        print(f"epoch {ep:02d} | val_loss={val_loss:.4f}")
 
         # Save best checkpoint
         if val_loss < best:

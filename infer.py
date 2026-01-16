@@ -240,13 +240,13 @@ def main():
     ap.add_argument("--session_prefix", default="sc04_d3_of")
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--out_csv", required=True)
-    ap.add_argument("--switch_penalty", type=float, default=3.5)
-    ap.add_argument("--min_turn", type=int, default=6)
-    ap.add_argument("--min_forward", type=int, default=8)
-    ap.add_argument("--min_still", type=int, default=15)
-    ap.add_argument("--min_explore", type=int, default=15)
+    ap.add_argument("--switch_penalty", type=float, default=4)
+    ap.add_argument("--min_turn", type=int, default=8)
+    ap.add_argument("--min_forward", type=int, default=10)
+    ap.add_argument("--min_still", type=int, default=12)
+    ap.add_argument("--min_explore", type=int, default=8)
     ap.add_argument("--min_rear", type=int, default=8)
-    ap.add_argument("--min_groom", type=int, default=12)
+    ap.add_argument("--min_groom", type=int, default=14)
 
     args = ap.parse_args()
 
@@ -307,6 +307,7 @@ def main():
     out["tcn_final"] = pred_final
     out["tcn_final_label"] = out["tcn_final"].map(STATE_MAP)
 
+    out.to_csv(args.out_csv, index=False)
     print(f"[OK] saved {args.out_csv}")
 
 if __name__ == "__main__":
