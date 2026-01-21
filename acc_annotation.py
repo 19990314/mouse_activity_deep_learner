@@ -46,7 +46,8 @@ def calculate_column_alignment(csv_path, col1, col2):
         for i in merged_labels.keys():
             mask = df_clean[col1] == i
             matches = (df_clean[col1] == df_clean[col2] & mask).sum()
-            percent_alignment = (matches / mask.sum()) * 100
+            if mask.sum() != 0:
+                percent_alignment = (matches / total_rows) * 100
             print(f"{merged_labels[i]}  Acc:        {percent_alignment:.2f}%")
         return percent_alignment
 

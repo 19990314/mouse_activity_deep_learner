@@ -276,7 +276,7 @@ def main():
     ap.add_argument("--seq_len", type=int, default=384)
     ap.add_argument("--stride", type=int, default=192)
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--lr", type=float, default=2e-4)
 
     ap.add_argument("--channels", type=int, default=128)

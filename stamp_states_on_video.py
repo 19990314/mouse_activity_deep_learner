@@ -225,20 +225,10 @@ def annotate_video(
     if column == "syllable_merged_label":
         df = mapping_and_merge(df)
 
-    # --- Optional kinematics-based refinement ---
-    # Refine a numeric per-frame column (e.g. 'syllable_merged' or your model's 'state' column)
-    if args.kinematics_mat is not None and args.refine_column is not None:
-        speed, angvel = load_kinematics_mat(args.kinematics_mat, args.speed_key, args.angvel_key)
-        refined = refine_states_with_kinematics(df[args.refine_column].to_numpy(), speed, angvel,
-                                                switch_penalty=args.switch_penalty)
-        df[args.refine_column + "_refined"] = refined
-        # Also provide readable labels
-        df[args.refine_column + "_refined_label"] = df[args.refine_column + "_refined"].map(merged_labels)
-
     root, ext = os.path.splitext(video_path)
     df.to_csv(root + "_annotations.csv", index=False)
 
-    no_video_writing_to_save_time_debug = 1
+    no_video_writing_to_save_time_debug = 0
     if no_video_writing_to_save_time_debug == 0:
         states = df[column]
         n_states = len(states)
@@ -283,10 +273,8 @@ def annotate_video(
                 matches = (df["syllable_merged"][0:frame_idx] == df["human_labeled_state"][0:frame_idx]).sum()
                 percent_alignment = (matches / frame_idx) * 100
 
-                text = (f"state: {state_val}"
-                        + str(df["syllable_merged"][frame_idx])
-                        + " vs " + str(merged_labels[df["human_labeled_state"][frame_idx]])
-                        + f" Acc: {percent_alignment:.2f}%")
+                text = (f"human labeled: {merged_labels[state_val]}"
+                        + " vs machine labeled: " + df["tcn_pred_label"][frame_idx])
 
             else:
                 # No more states; optionally break instead of leaving blank
@@ -371,5 +359,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    calculate_column_alignment(r"D:\My Drive\moseq_proj\data\videos\test\sc04_d3_10mintest_annotations.csv",
-                               'human_labeled_state', 'syllable_merged')
