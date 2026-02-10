@@ -270,7 +270,7 @@ def annotate_video(
                 break
             if frame_idx < n_states:
                 state_val = states[frame_idx]
-                matches = (df["syllable_merged"][0:frame_idx] == df["human_labeled_state"][0:frame_idx]).sum()
+                matches = (df["tcn_pred_label"][0:frame_idx] == df["human_labeled_state"][0:frame_idx]).sum()
                 percent_alignment = (matches / frame_idx) * 100
 
                 text = (f"human labeled: {merged_labels[state_val]}"

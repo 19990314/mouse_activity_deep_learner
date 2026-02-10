@@ -47,7 +47,7 @@ class MoSeqAnnotator(QWidget):
 
         self.load_video_btn.clicked.connect(self.load_video)
         self.load_ann_btn.clicked.connect(self.load_annotation)
-        self.save_ann_btn.clicked.connect(self.save_annotation)
+        self.save_ann_btn.clicked.connect(self.saschenve_annotation)
 
         # Playback timer
         self.timer = QTimer()
