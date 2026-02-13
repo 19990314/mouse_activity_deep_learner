@@ -1,6 +1,82 @@
 
 conda env create --name envname --file=environments.yml
 
+##=============================model introduction======================================
+1. Input Features
+Each frame is represented by a multi-modal feature vector constructed from three data sources:
+Pose estimation (DeepLabCut). For each tracked bodypart, we extract the x/y coordinates and frame-to-frame velocity (Δx, Δy), yielding four features per bodypart. Coordinates with tracking confidence below a threshold (default p < 0.6) are marked as missing and filled via linear interpolation in both temporal directions. Two summary statistics of tracking confidence — the mean and minimum across all bodyparts — are appended as global reliability features.
+Latent behavioral features (MoSeq). From the MoSeq annotation output, we include the discrete syllable identity, four continuous latent state dimensions, and the animal's centroid position (x, y) and heading angle, contributing eight features.
+Kinematics. From the centroid tracking data stored in a combined MATLAB structure, we extract instantaneous speed (pixels/frame) and angular velocity, adding two features.
+The resulting feature matrix has dimensionality T × F, where T is the number of frames and F is the total number of features (determined by the number of tracked bodyparts). All features are z-score normalized using the mean and standard deviation computed from the training partition only.
+2. Label Preprocessing
+Human-annotated behavioral state labels serve as the ground truth. Prior to training, labels are smoothed with a sliding-window majority vote filter (default window = 9 frames) to reduce annotation jitter at state boundaries. Frames labeled as "unsigned" (label = −1) are excluded from the loss computation via a per-frame binary mask.
+3. Model Architecture
+The classifier is a one-dimensional Temporal Convolutional Network operating on the full temporal sequence. The architecture consists of:
+
+Input projection. A 1×1 convolution maps the F-dimensional feature vector to an internal channel dimension (default 128).
+Residual TCN blocks. A stack of 8 residual blocks with exponentially increasing dilation factors (2⁰, 2¹, …, 2⁷). Each block contains two dilated causal convolutions (kernel size 5), each followed by batch normalization, GELU activation, and dropout (default p = 0.1). A skip connection adds the block input to its output. At the maximum dilation of 128 and kernel size 5, the effective receptive field spans 2 × (128 × 2) × 8 = 4,096 frames, equivalent to approximately 136 seconds at 30 fps, allowing the model to capture long-range temporal context.
+Output projection. A 1×1 convolution maps from the channel dimension to 6 class logits per frame.
+
+The model processes variable-length sequences shaped (B, T, F) and outputs frame-level logits (B, T, 6).
+4. Training
+Training data are organized as overlapping temporal chunks (default length 384 frames, stride 192) drawn from the training partition of each session. The dataset supports multi-session training: features from multiple recording sessions can be pooled, with normalization statistics computed jointly from all training partitions.
+Two data splitting strategies are supported:
+
+Temporal split (default): within each session, the first 80% of frames are used for training and the remaining 20% for validation, preventing temporal leakage.
+Session-level split: entire sessions are held out for validation, testing generalization across animals and recording days.
+
+The model is trained with the AdamW optimizer (learning rate 2 × 10⁻⁴, weight decay 10⁻⁴) using mixed-precision training. The loss function combines two terms:
+
+Masked cross-entropy loss: standard categorical cross-entropy computed only over frames with valid (non-ignored) ground-truth labels.
+Temporal total variation penalty (weight λ = 0.04): the mean absolute difference of logits between consecutive frames, which encourages temporal smoothness in the model's raw output and reduces high-frequency label flickering.
+
+The model is trained for 120 epochs with a batch size of 16. The checkpoint with the lowest validation loss is retained, and it stores the model weights, normalization statistics, feature names, and all training hyperparameters to ensure reproducible inference.
+5. Inference and Temporal Post-Processing
+At inference time, the full-length feature sequence is passed through the trained TCN in a single forward pass. The raw per-frame class predictions (argmax of softmax probabilities) undergo two stages of temporal post-processing:
+Viterbi decoding. The frame-level log-probabilities are decoded with the Viterbi algorithm under a simple transition model: a fixed penalty (default 4.0) is applied for each state switch, favoring sustained behavioral bouts over rapid alternation. This is equivalent to a hidden Markov model with uniform self-transition preference.
+Minimum bout duration enforcement. After Viterbi decoding, any behavioral bout shorter than a class-specific minimum duration is merged into its temporal neighbor. Default minimum durations (in frames at 30 fps) are: turn = 8, forward = 10, still = 12, explore = 8, rear = 8, groom = 14. Short bouts are absorbed into the preceding state if available, otherwise the following state.
+The output CSV contains three prediction columns for each frame — raw argmax, Viterbi-decoded, and final post-processed — enabling comparison of post-processing effects.
+6. Evaluation Metrics
+Evaluation emphasizes bout-level accuracy rather than raw frame-level agreement, reflecting the ethological significance of discrete behavioral episodes. Three families of metrics are computed:
+6.1 Bout-Level Precision, Recall, and F1
+Ground-truth and predicted label sequences are first segmented into contiguous bouts (runs of identical labels). For each behavioral class, predicted bouts are matched to ground-truth bouts using temporal Intersection-over-Union (IoU). A predicted bout is considered a true positive if its IoU with a ground-truth bout of the same class exceeds a threshold (default IoU ≥ 0.1). Each ground-truth bout is matched to at most one prediction and vice versa.
+Per-class precision, recall, and F1 are computed from the true positive, false positive (unmatched predictions), and false negative (unmatched ground-truth bouts) counts. Overall metrics are macro-averaged across classes. The mean IoU of matched bout pairs provides a measure of temporal overlap quality beyond binary detection.
+6.2 Boundary Tolerance Score
+This metric evaluates how precisely the model detects behavioral transitions (state boundaries). Every frame where the ground-truth label changes is identified as a reference transition. A predicted transition is considered a true positive if it falls within ±τ frames of any reference transition. We evaluate at multiple tolerance levels (e.g., τ = 5, 10, 15 frames, corresponding to approximately ±0.17, ±0.33, and ±0.50 seconds at 30 fps). The resulting precision-recall-F1 curve across tolerance values characterizes the model's temporal alignment: a steep increase from strict to lenient tolerance indicates that transitions are detected but slightly misaligned, while persistently low scores indicate genuinely missed or hallucinated transitions.
+6.3 Frame-Level Confusion Matrix
+A standard frame-level confusion matrix (row-normalized) is reported for completeness. While informative for identifying systematic misclassification patterns (e.g., confusion between "turn" and "explore"), it does not capture bout-level accuracy and is therefore treated as a secondary diagnostic.
+6.4 Bout Duration Comparison
+For each behavioral class, the distribution of bout durations (in seconds) is summarized by the median and interquartile range (IQR), reported separately for ground truth and model predictions. Systematic discrepancies — such as the model producing shorter bouts than the human annotator — indicate biases in temporal segmentation that may warrant adjustment of post-processing parameters.
+6.5 Multi-Session Aggregate Evaluation
+When evaluating across multiple sessions, per-session metrics are computed independently and then aggregated by pooling all ground-truth and predicted frames. Cross-session comparison plots — per-class F1 grouped by session and overall precision/recall/F1 per session — identify sessions where model performance diverges, indicating potential domain shift across animals or recording conditions.
+
+
+##=============================build your model======================================
+1. for each video, you will need:
+    a. a csv containing human-labeled states
+    generated from: moseq_state_annotator.py
+    b. a *_auto_vTrack_angle.mat file containing the speed and orientation kinematics
+    generated from: step1_analyze_OF_autoTrack_angle.m
+    c. combined_data.mat includes all *_auto_vTrack_angle.mat items
+    generated from: step2_calcTrackingFeatures_AngleandSpeed.m
+    c. a *filtered.h5 file containing the coordinates of 11 body parts with tracking confidences
+    generated from: DLC
+    d. a manifest.csv includes session_prefix,dlc_h5,ann_csv
+
+2. train your model
+python bunch_train.py
+--data_dir
+"D:\My Drive\video_anno\filtered_dlc\for_training"
+--combined_mat
+"D:\My Drive\video_anno\filtered_dlc\for_training\combined_data.mat"
+--label_col
+human_labeled_state
+--out_ckpt
+"D:\My Drive\video_anno\filtered_dlc\training_results\tcn_sc11sc31sc29sc15.pt"
+--split_mode
+temporal
+
+##=========================stamp labels to new video===============================
 How to execute:
 python stamp_states_on_video.py
 --video of_video_to_be_analyzed.mp4
