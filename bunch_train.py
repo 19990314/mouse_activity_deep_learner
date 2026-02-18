@@ -1,43 +1,31 @@
 #!/usr/bin/env python3
 """
-train.py — Extended multi-session TCN trainer
+train.py — Extended multi-session TCN trainer with hyperparameter search
 
-Supports two input modes:
-  1. Single-session (original):
-       --dlc_h5 FILE --ann_csv FILE --combined_mat FILE --session_prefix PREFIX
-
-  2. Multi-session via data directory:
-       --data_dir FOLDER --combined_mat FILE
-     The folder must contain a manifest.csv with columns:
-       session_prefix, dlc_h5, ann_csv
-     Paths in manifest.csv are relative to --data_dir.
-     Optionally, each row can include a `mat_path` column to override --combined_mat.
-
-     If no manifest.csv exists, the script auto-discovers sessions by scanning
-     for paired files: *_dlc.h5 / *.h5 and *_annotations.csv / *_ann.csv.
-
-Train/val split modes (--split_mode):
-  - "temporal" (default): 80/20 time-split within each session, then pool.
-  - "session": hold out ~20% of sessions entirely for validation.
+New features vs previous version:
+  - Early stopping (--patience, default 15 epochs)
+  - Cosine annealing LR scheduler
+  - Training curve logged to CSV (train_loss, val_loss, lr per epoch)
+  - Hyperparameter sweep mode (--sweep): tries grid of configs, logs results
 
 Usage examples:
-  # Single session (backward-compatible)
-  python train.py --dlc_h5 data/sc04_d1_of.h5 --ann_csv data/sc04_d1_of_ann.csv \
-    --combined_mat data/combined.mat --session_prefix sc04_d1_of --out_ckpt model.pt
-
-  # Multi-session from folder
+  # Train single config
   python train.py --data_dir data/sessions/ --combined_mat data/combined.mat \
-    --out_ckpt model.pt --split_mode temporal
+    --out_ckpt model.pt
 
-  # Multi-session, hold-out session split
+  # Hyperparameter sweep (finds best config automatically)
   python train.py --data_dir data/sessions/ --combined_mat data/combined.mat \
-    --out_ckpt model.pt --split_mode session --val_fraction 0.2
+    --out_ckpt model.pt --sweep
 """
 
 import argparse
+import csv
 import glob
+import itertools
+import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -47,6 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from scipy.io import loadmat
 
@@ -61,7 +50,7 @@ STATE_MAP = {
 VALID_CLASSES = [0, 1, 2, 3, 4, 5]
 
 # ============================================================
-# Model (unchanged)
+# Model
 # ============================================================
 class TCNBlock(nn.Module):
     def __init__(self, channels, kernel_size=5, dilation=1, dropout=0.25):
@@ -98,11 +87,14 @@ class TCN(nn.Module):
         self.out_proj = nn.Conv1d(channels, n_classes, kernel_size=1)
 
     def forward(self, x):
-        x = x.transpose(1, 2)       # (B, T, F) -> (B, F, T)
+        x = x.transpose(1, 2)
         x = self.in_proj(x)
         x = self.blocks(x)
-        logits = self.out_proj(x)    # (B, K, T)
-        return logits.transpose(1, 2)  # (B, T, K)
+        logits = self.out_proj(x)
+        return logits.transpose(1, 2)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 # ============================================================
 # Data utilities
@@ -267,8 +259,6 @@ def compute_norm_stats(X: np.ndarray, eps: float = 1e-6):
 # ============================================================
 
 def discover_sessions_from_manifest(data_dir: str) -> List[Dict]:
-    """Read manifest.csv from data_dir. Expected columns: session_prefix, dlc_h5, ann_csv.
-    Optional column: mat_path (overrides --combined_mat per session)."""
     manifest_path = os.path.join(data_dir, "manifest.csv")
     if not os.path.isfile(manifest_path):
         raise FileNotFoundError(f"No manifest.csv found in {data_dir}")
@@ -293,30 +283,22 @@ def discover_sessions_from_manifest(data_dir: str) -> List[Dict]:
 
 
 def auto_discover_sessions(data_dir: str) -> List[Dict]:
-    """Heuristic: scan data_dir for paired .h5 and _ann.csv / _annotations.csv files.
-    Derives session_prefix from the common filename stem."""
     data_dir = Path(data_dir)
-
-    # Find all h5 files
     h5_files = sorted(data_dir.glob("*.h5"))
     if not h5_files:
         raise FileNotFoundError(f"No .h5 files found in {data_dir}")
 
     sessions = []
     for h5 in h5_files:
-        stem = h5.stem  # e.g. "sc04_d1_of_dlc" or "sc04_d1_of"
-
-        # Strip common DLC suffixes to get session prefix
+        stem = h5.stem
         prefix = re.sub(r"[_-]?dlc$", "", stem, flags=re.IGNORECASE)
         prefix = re.sub(r"[_-]?DLC_resnet.*$", "", prefix)
 
-        # Search for matching annotation CSV
         ann_candidates = [
             data_dir / f"{prefix}_annotations.csv",
             data_dir / f"{prefix}_ann.csv",
             data_dir / f"{prefix}.csv",
         ]
-        # Also try glob for partial matches
         ann_glob = sorted(data_dir.glob(f"{prefix}*ann*.csv"))
         ann_candidates.extend(ann_glob)
 
@@ -345,7 +327,6 @@ def auto_discover_sessions(data_dir: str) -> List[Dict]:
 
 
 def load_sessions(data_dir: str) -> List[Dict]:
-    """Try manifest.csv first, fall back to auto-discovery."""
     manifest_path = os.path.join(data_dir, "manifest.csv")
     if os.path.isfile(manifest_path):
         print(f"[Sessions] Loading from manifest: {manifest_path}")
@@ -362,7 +343,6 @@ def load_all_sessions(
     dlc_conf_thr: float,
     smooth_label_win: int,
 ) -> List[Dict]:
-    """Load and build features for every session. Returns list of dicts with X, y, mask, etc."""
     loaded = []
     for sess in sessions:
         prefix = sess["session_prefix"]
@@ -378,13 +358,11 @@ def load_all_sessions(
         except Exception as e:
             print(f"  [ERROR] Failed to load DLC h5: {e}")
             continue
-
         try:
             ann_df = pd.read_csv(sess["ann_csv"])
         except Exception as e:
             print(f"  [ERROR] Failed to load annotation CSV: {e}")
             continue
-
         try:
             speed, w, fps, mat_name = load_kinematics_from_combined_mat(mat_path, prefix)
         except Exception as e:
@@ -402,12 +380,9 @@ def load_all_sessions(
 
         loaded.append({
             "session_prefix": prefix,
-            "X": X,
-            "y": y,
-            "mask": mask,
+            "X": X, "y": y, "mask": mask,
             "feat_names": feat_names,
-            "fps": fps,
-            "mat_name": mat_name,
+            "fps": fps, "mat_name": mat_name,
         })
 
     if not loaded:
@@ -459,7 +434,7 @@ def temporal_tv_penalty(logits, weight=0.02):
 
 
 # ============================================================
-# Train/val splitting strategies
+# Train/val splitting
 # ============================================================
 
 def split_temporal(
@@ -470,7 +445,6 @@ def split_temporal(
     seq_len: int,
     stride: int,
 ) -> Tuple[Dataset, Dataset]:
-    """80/20 temporal split within each session, then concatenate."""
     train_datasets = []
     val_datasets = []
 
@@ -500,7 +474,6 @@ def split_by_session(
     seq_len: int,
     stride: int,
 ) -> Tuple[Dataset, Dataset]:
-    """Hold out entire sessions for validation."""
     n = len(session_data)
     n_val = max(1, int(round(val_fraction * n)))
     n_train = n - n_val
@@ -511,7 +484,6 @@ def split_by_session(
             f"Use --split_mode temporal instead."
         )
 
-    # Deterministic shuffle by session name for reproducibility
     indices = list(range(n))
     indices.sort(key=lambda i: session_data[i]["session_prefix"])
     train_idx = indices[:n_train]
@@ -542,146 +514,56 @@ def split_by_session(
 
 
 # ============================================================
-# Main
+# Single training run (reusable by sweep)
 # ============================================================
-def main():
-    ap = argparse.ArgumentParser(
-        description="Train TCN for mouse behavior classification (single or multi-session)."
-    )
 
-    # --- Input mode: single-session ---
-    ap.add_argument("--dlc_h5", default=None,
-                    help="Single-session DLC .h5 file.")
-    ap.add_argument("--ann_csv", default=None,
-                    help="Single-session annotation CSV.")
-    ap.add_argument("--session_prefix", default=None,
-                    help="Session prefix for MAT lookup (single-session mode).")
+def train_one_config(
+    session_data: List[Dict],
+    n_features: int,
+    feat_names: List[str],
+    args,
+    # Overrides for sweep
+    channels: int = None,
+    levels: int = None,
+    kernel_size: int = None,
+    dropout: float = None,
+    lr: float = None,
+    tv_weight: float = None,
+    seq_len: int = None,
+    stride: int = None,
+    out_ckpt: str = None,
+    verbose: bool = True,
+) -> Dict:
+    """
+    Train one model configuration. Returns dict with:
+      best_val_loss, best_epoch, total_epochs, n_params, config, train_curve
+    """
+    channels = channels or args.channels
+    levels = levels or args.levels
+    kernel_size = kernel_size or args.kernel_size
+    dropout = dropout if dropout is not None else args.dropout
+    lr = lr or args.lr
+    tv_weight = tv_weight if tv_weight is not None else args.tv_weight
+    seq_len = seq_len or args.seq_len
+    stride = stride or args.stride
+    out_ckpt = out_ckpt or args.out_ckpt
 
-    # --- Input mode: multi-session ---
-    ap.add_argument("--data_dir", default=None,
-                    help="Directory containing session files + optional manifest.csv. "
-                         "If provided, overrides --dlc_h5/--ann_csv/--session_prefix.")
-
-    # --- Shared ---
-    ap.add_argument("--combined_mat", default=None,
-                    help="Path to combined .mat with kinematics (shared across sessions).")
-    ap.add_argument("--label_col", default="human_labeled_state")
-    ap.add_argument("--out_ckpt", required=True)
-
-    # --- Split ---
-    ap.add_argument("--split_mode", choices=["temporal", "session"], default="temporal",
-                    help="'temporal': 80/20 time-split per session. "
-                         "'session': hold out entire sessions for val.")
-    ap.add_argument("--val_fraction", type=float, default=0.2,
-                    help="Fraction of data (or sessions) for validation.")
-
-    # --- Preprocessing ---
-    ap.add_argument("--dlc_conf_thr", type=float, default=0.7)
-    ap.add_argument("--smooth_label_win", type=int, default=9)
-
-    # --- Training ---
-    ap.add_argument("--seq_len", type=int, default=384)
-    ap.add_argument("--stride", type=int, default=192)
-    ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--lr", type=float, default=2e-4)
-
-    # --- Model ---
-    ap.add_argument("--channels", type=int, default=32)
-    ap.add_argument("--levels", type=int, default=6)
-    ap.add_argument("--kernel_size", type=int, default=5)
-    ap.add_argument("--dropout", type=float, default=0.25)
-    ap.add_argument("--tv_weight", type=float, default=0.04)
-
-    args = ap.parse_args()
+    config = {
+        "channels": channels, "levels": levels, "kernel_size": kernel_size,
+        "dropout": dropout, "lr": lr, "tv_weight": tv_weight,
+        "seq_len": seq_len, "stride": stride,
+    }
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[Device] {device}")
 
-    # =============================================
-    # Resolve input mode
-    # =============================================
-    if args.data_dir is not None:
-        # --- Multi-session mode ---
-        if args.combined_mat is None:
-            # Check if there's a single .mat in data_dir
-            mat_files = list(Path(args.data_dir).glob("*.mat"))
-            if len(mat_files) == 1:
-                args.combined_mat = str(mat_files[0])
-                print(f"[Auto] Found single .mat in data_dir: {args.combined_mat}")
-            else:
-                raise ValueError(
-                    "--combined_mat is required (or place exactly one .mat in --data_dir)."
-                )
-
-        sessions = load_sessions(args.data_dir)
-        print(f"\n[Sessions] Found {len(sessions)} session(s):")
-        for s in sessions:
-            print(f"  - {s['session_prefix']}")
-
-        session_data = load_all_sessions(
-            sessions,
-            combined_mat=args.combined_mat,
-            label_col=args.label_col,
-            dlc_conf_thr=args.dlc_conf_thr,
-            smooth_label_win=args.smooth_label_win,
-        )
-
-    else:
-        # --- Single-session mode (original) ---
-        if not all([args.dlc_h5, args.ann_csv, args.combined_mat, args.session_prefix]):
-            raise ValueError(
-                "Single-session mode requires: --dlc_h5, --ann_csv, --combined_mat, --session_prefix. "
-                "Alternatively, use --data_dir for multi-session mode."
-            )
-
-        dlc_df = load_dlc_h5(args.dlc_h5)
-        ann_df = pd.read_csv(args.ann_csv)
-        speed, w, fps, mat_name = load_kinematics_from_combined_mat(
-            args.combined_mat, args.session_prefix
-        )
-        print(f"[MAT] matched: {mat_name} | fps={fps}")
-
-        X, y, mask, feat_names = build_feature_matrix(
-            dlc_df, ann_df, speed, w,
-            label_col=args.label_col,
-            dlc_conf_thr=args.dlc_conf_thr,
-            smooth_label_win=args.smooth_label_win,
-        )
-        print(f"[Data] T={len(X)} F={X.shape[1]} valid_frames={mask.sum()}")
-
-        session_data = [{
-            "session_prefix": args.session_prefix,
-            "X": X, "y": y, "mask": mask,
-            "feat_names": feat_names,
-            "fps": fps, "mat_name": mat_name,
-        }]
-
-    # =============================================
-    # Validate feature consistency across sessions
-    # =============================================
-    n_features = session_data[0]["X"].shape[1]
-    feat_names = session_data[0]["feat_names"]
-    for sess in session_data[1:]:
-        if sess["X"].shape[1] != n_features:
-            raise ValueError(
-                f"Feature dimension mismatch: {sess['session_prefix']} has "
-                f"{sess['X'].shape[1]} features, expected {n_features}. "
-                f"All sessions must have the same DLC bodyparts and annotation columns."
-            )
-
-    # =============================================
-    # Compute normalization stats from TRAIN data
-    # =============================================
+    # --- Normalization stats (from train partition only) ---
     if args.split_mode == "temporal":
-        # Use first 80% of each session for norm stats
         train_chunks = []
         for sess in session_data:
             split = int((1.0 - args.val_fraction) * len(sess["X"]))
             train_chunks.append(sess["X"][:split])
         X_train_all = np.concatenate(train_chunks, axis=0)
     else:
-        # Use all data from train sessions
         n = len(session_data)
         n_val = max(1, int(round(args.val_fraction * n)))
         indices = list(range(n))
@@ -690,52 +572,48 @@ def main():
         X_train_all = np.concatenate(
             [session_data[i]["X"] for i in train_idx], axis=0
         )
-
     norm_mean, norm_std = compute_norm_stats(X_train_all)
-    del X_train_all  # free memory
+    del X_train_all
 
-    # =============================================
-    # Build datasets
-    # =============================================
+    # --- Build datasets ---
     if args.split_mode == "temporal":
         train_ds, val_ds = split_temporal(
             session_data, args.val_fraction,
-            norm_mean, norm_std,
-            args.seq_len, args.stride,
+            norm_mean, norm_std, seq_len, stride,
         )
     else:
         if len(session_data) < 2:
-            print("[WARN] Only 1 session loaded — falling back to temporal split.")
             train_ds, val_ds = split_temporal(
                 session_data, args.val_fraction,
-                norm_mean, norm_std,
-                args.seq_len, args.stride,
+                norm_mean, norm_std, seq_len, stride,
             )
         else:
             train_ds, val_ds = split_by_session(
                 session_data, args.val_fraction,
-                norm_mean, norm_std,
-                args.seq_len, args.stride,
+                norm_mean, norm_std, seq_len, stride,
             )
-
-    print(f"\n[Dataset] Train chunks: {len(train_ds)}, Val chunks: {len(val_ds)}")
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
-    # =============================================
-    # Model
-    # =============================================
+    # --- Model ---
     model = TCN(
-        in_features=n_features,
-        n_classes=6,
-        channels=args.channels,
-        levels=args.levels,
-        kernel_size=args.kernel_size,
-        dropout=args.dropout,
+        in_features=n_features, n_classes=6,
+        channels=channels, levels=levels,
+        kernel_size=kernel_size, dropout=dropout,
     ).to(device)
 
-    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    n_params = model.count_parameters()
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"[Config] ch={channels} lv={levels} ks={kernel_size} "
+              f"do={dropout} lr={lr} tv={tv_weight} seq={seq_len} str={stride}")
+        print(f"[Model]  {n_params:,} parameters")
+        print(f"[Data]   Train chunks: {len(train_ds)}, Val chunks: {len(val_ds)}")
+        print(f"{'='*60}")
+
+    opt = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(opt, T_max=args.epochs, eta_min=lr * 0.01)
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
 
     @torch.no_grad()
@@ -749,37 +627,53 @@ def main():
             losses.append(loss.item())
         return float(np.mean(losses)) if losses else float("inf")
 
-    # =============================================
-    # Training loop
-    # =============================================
-    best = float("inf")
+    # --- Training loop ---
+    best_val = float("inf")
+    best_epoch = 0
+    patience_counter = 0
+    train_curve = []
     session_prefixes = [s["session_prefix"] for s in session_data]
 
     for ep in range(1, args.epochs + 1):
         model.train()
+        epoch_losses = []
         for xb, yb, mb in train_dl:
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
             opt.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
                 logits = model(xb)
                 loss = (masked_ce_loss(logits, yb, mb)
-                        + temporal_tv_penalty(logits, weight=args.tv_weight))
+                        + temporal_tv_penalty(logits, weight=tv_weight))
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+            epoch_losses.append(loss.item())
+
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
 
         val_loss = eval_val()
-        print(f"epoch {ep:03d} | val_loss={val_loss:.4f}")
+        train_loss = float(np.mean(epoch_losses))
+        train_curve.append((ep, train_loss, val_loss, current_lr))
 
-        if val_loss < best:
-            best = val_loss
+        improved = val_loss < best_val
+        if verbose:
+            marker = " *" if improved else ""
+            print(f"epoch {ep:03d} | train={train_loss:.4f} val={val_loss:.4f} "
+                  f"lr={current_lr:.2e}{marker}")
+
+        if improved:
+            best_val = val_loss
+            best_epoch = ep
+            patience_counter = 0
+
             ckpt = {
                 "state_dict": model.state_dict(),
                 "in_features": int(n_features),
-                "channels": int(args.channels),
-                "levels": int(args.levels),
-                "kernel_size": int(args.kernel_size),
-                "dropout": float(args.dropout),
+                "channels": int(channels),
+                "levels": int(levels),
+                "kernel_size": int(kernel_size),
+                "dropout": float(dropout),
                 "feature_names": feat_names,
                 "norm_mean": norm_mean.astype(np.float32),
                 "norm_std": norm_std.astype(np.float32),
@@ -790,11 +684,301 @@ def main():
                 "fps": float(session_data[0]["fps"]),
                 "smooth_label_win": int(args.smooth_label_win),
                 "dlc_conf_thr": float(args.dlc_conf_thr),
+                "best_val_loss": float(best_val),
+                "best_epoch": int(best_epoch),
+                "config": config,
             }
-            torch.save(ckpt, args.out_ckpt)
-            print(f"  [CKPT] saved best -> {args.out_ckpt}")
+            torch.save(ckpt, out_ckpt)
+            if verbose:
+                print(f"  [CKPT] saved -> {out_ckpt}")
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                if verbose:
+                    print(f"[Early stop] No improvement for {args.patience} epochs. "
+                          f"Best: epoch {best_epoch}, val_loss={best_val:.4f}")
+                break
 
-    print(f"\n[Done] best val_loss={best:.4f} | sessions={session_prefixes}")
+    return {
+        "best_val_loss": best_val,
+        "best_epoch": best_epoch,
+        "total_epochs": ep,
+        "n_params": n_params,
+        "config": config,
+        "train_curve": train_curve,
+        "out_ckpt": out_ckpt,
+    }
+
+
+# ============================================================
+# Hyperparameter sweep
+# ============================================================
+
+# Search grid — targeted for small-data regime (3-5 sessions)
+SWEEP_GRID = {
+    "channels":    [32, 64, 96],
+    "levels":      [4, 6, 8],
+    "dropout":     [0.15, 0.25, 0.35],
+    "lr":          [1e-4, 3e-4],
+    "tv_weight":   [0.04, 0.08],
+    "kernel_size": [5],
+    "seq_len":     [384],
+    "stride":      [256],
+}
+# Total: 3 × 3 × 3 × 2 × 2 = 108 configs
+
+
+def generate_sweep_configs(grid: Dict) -> List[Dict]:
+    keys = sorted(grid.keys())
+    combos = list(itertools.product(*(grid[k] for k in keys)))
+    return [dict(zip(keys, combo)) for combo in combos]
+
+
+def run_sweep(session_data, n_features, feat_names, args):
+    configs = generate_sweep_configs(SWEEP_GRID)
+    n_configs = len(configs)
+
+    out_dir = Path(args.out_ckpt).parent
+    sweep_dir = out_dir / "sweep"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    sweep_log_path = sweep_dir / "sweep_results.csv"
+    print(f"\n{'#'*60}")
+    print(f"[SWEEP] {n_configs} configurations to evaluate")
+    print(f"[SWEEP] Results -> {sweep_log_path}")
+    print(f"{'#'*60}")
+
+    results = []
+
+    for i, cfg in enumerate(configs, 1):
+        tag = (f"ch{cfg['channels']}_lv{cfg['levels']}_ks{cfg['kernel_size']}"
+               f"_do{cfg['dropout']}_lr{cfg['lr']}_tv{cfg['tv_weight']}")
+        ckpt_path = str(sweep_dir / f"sweep_{tag}.pt")
+
+        print(f"\n[SWEEP {i}/{n_configs}] {tag}")
+        t0 = time.time()
+
+        try:
+            result = train_one_config(
+                session_data, n_features, feat_names, args,
+                channels=cfg["channels"], levels=cfg["levels"],
+                kernel_size=cfg["kernel_size"], dropout=cfg["dropout"],
+                lr=cfg["lr"], tv_weight=cfg["tv_weight"],
+                seq_len=cfg["seq_len"], stride=cfg["stride"],
+                out_ckpt=ckpt_path, verbose=True,
+            )
+            elapsed = time.time() - t0
+            result["tag"] = tag
+            result["elapsed_s"] = elapsed
+            results.append(result)
+
+            print(f"[SWEEP {i}/{n_configs}] best_val={result['best_val_loss']:.4f} "
+                  f"@ ep {result['best_epoch']} | {result['n_params']:,} params | {elapsed:.0f}s")
+
+        except Exception as e:
+            print(f"[SWEEP {i}/{n_configs}] FAILED: {e}")
+            results.append({
+                "tag": tag, "config": cfg,
+                "best_val_loss": float("inf"),
+                "best_epoch": 0, "total_epochs": 0,
+                "n_params": 0, "elapsed_s": 0, "error": str(e),
+            })
+
+    # --- Write sweep CSV ---
+    with open(sweep_log_path, "w", newline="") as f:
+        fieldnames = [
+            "rank", "tag", "best_val_loss", "best_epoch", "total_epochs",
+            "n_params", "elapsed_s",
+            "channels", "levels", "kernel_size", "dropout", "lr", "tv_weight",
+            "seq_len", "stride",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        sorted_results = sorted(results, key=lambda r: r["best_val_loss"])
+        for rank, r in enumerate(sorted_results, 1):
+            cfg = r.get("config", {})
+            writer.writerow({
+                "rank": rank, "tag": r.get("tag", ""),
+                "best_val_loss": f"{r['best_val_loss']:.6f}",
+                "best_epoch": r.get("best_epoch", 0),
+                "total_epochs": r.get("total_epochs", 0),
+                "n_params": r.get("n_params", 0),
+                "elapsed_s": f"{r.get('elapsed_s', 0):.1f}",
+                "channels": cfg.get("channels", ""),
+                "levels": cfg.get("levels", ""),
+                "kernel_size": cfg.get("kernel_size", ""),
+                "dropout": cfg.get("dropout", ""),
+                "lr": cfg.get("lr", ""),
+                "tv_weight": cfg.get("tv_weight", ""),
+                "seq_len": cfg.get("seq_len", ""),
+                "stride": cfg.get("stride", ""),
+            })
+
+    # --- Copy best checkpoint ---
+    valid = [r for r in results if r["best_val_loss"] < float("inf")]
+    if valid:
+        best = min(valid, key=lambda r: r["best_val_loss"])
+        best_ckpt = best.get("out_ckpt")
+        if best_ckpt and os.path.isfile(best_ckpt):
+            import shutil
+            shutil.copy2(best_ckpt, args.out_ckpt)
+            print(f"\n{'='*60}")
+            print(f"[SWEEP DONE] Best config: {best['tag']}")
+            print(f"  val_loss = {best['best_val_loss']:.4f} @ epoch {best['best_epoch']}")
+            print(f"  params   = {best['n_params']:,}")
+            print(f"  config   = {best['config']}")
+            print(f"  Saved to: {args.out_ckpt}")
+            print(f"  All results: {sweep_log_path}")
+            print(f"{'='*60}")
+
+        # Save top-5 training curves
+        top5 = sorted(valid, key=lambda r: r["best_val_loss"])[:5]
+        for r in top5:
+            curve = r.get("train_curve", [])
+            if curve:
+                curve_path = sweep_dir / f"curve_{r['tag']}.csv"
+                with open(curve_path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["epoch", "train_loss", "val_loss", "lr"])
+                    for row in curve:
+                        w.writerow(row)
+    else:
+        print("[SWEEP] All configurations failed!")
+
+    return results
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    ap = argparse.ArgumentParser(
+        description="Train TCN for mouse behavior classification. "
+                    "Use --sweep for automatic hyperparameter search."
+    )
+
+    # Input
+    ap.add_argument("--dlc_h5", default=None)
+    ap.add_argument("--ann_csv", default=None)
+    ap.add_argument("--session_prefix", default=None)
+    ap.add_argument("--data_dir", default=None)
+    ap.add_argument("--combined_mat", default=None)
+    ap.add_argument("--label_col", default="human_labeled_state")
+    ap.add_argument("--out_ckpt", required=True)
+
+    # Split
+    ap.add_argument("--split_mode", choices=["temporal", "session"], default="temporal")
+    ap.add_argument("--val_fraction", type=float, default=0.2)
+
+    # Preprocessing
+    ap.add_argument("--dlc_conf_thr", type=float, default=0.7)
+    ap.add_argument("--smooth_label_win", type=int, default=9)
+
+    # Training
+    ap.add_argument("--seq_len", type=int, default=384)
+    ap.add_argument("--stride", type=int, default=256)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--patience", type=int, default=15,
+                    help="Early stopping: stop after N epochs with no val improvement.")
+
+    # Model
+    ap.add_argument("--channels", type=int, default=32)
+    ap.add_argument("--levels", type=int, default=6)
+    ap.add_argument("--kernel_size", type=int, default=5)
+    ap.add_argument("--dropout", type=float, default=0.25)
+    ap.add_argument("--tv_weight", type=float, default=0.04)
+
+    # Sweep
+    ap.add_argument("--sweep", action="store_true",
+                    help="Run hyperparameter sweep over predefined grid.")
+
+    args = ap.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Device] {device}")
+
+    # =============================================
+    # Load data
+    # =============================================
+    if args.data_dir is not None:
+        if args.combined_mat is None:
+            mat_files = list(Path(args.data_dir).glob("*.mat"))
+            if len(mat_files) == 1:
+                args.combined_mat = str(mat_files[0])
+                print(f"[Auto] Found single .mat: {args.combined_mat}")
+            else:
+                raise ValueError("--combined_mat required (or place one .mat in --data_dir).")
+
+        sessions = load_sessions(args.data_dir)
+        print(f"\n[Sessions] Found {len(sessions)} session(s):")
+        for s in sessions:
+            print(f"  - {s['session_prefix']}")
+
+        session_data = load_all_sessions(
+            sessions, combined_mat=args.combined_mat,
+            label_col=args.label_col,
+            dlc_conf_thr=args.dlc_conf_thr,
+            smooth_label_win=args.smooth_label_win,
+        )
+    else:
+        if not all([args.dlc_h5, args.ann_csv, args.combined_mat, args.session_prefix]):
+            raise ValueError(
+                "Single-session mode requires: --dlc_h5, --ann_csv, --combined_mat, --session_prefix. "
+                "Or use --data_dir for multi-session."
+            )
+        dlc_df = load_dlc_h5(args.dlc_h5)
+        ann_df = pd.read_csv(args.ann_csv)
+        speed, w, fps, mat_name = load_kinematics_from_combined_mat(
+            args.combined_mat, args.session_prefix)
+        print(f"[MAT] matched: {mat_name} | fps={fps}")
+
+        X, y, mask, feat_names = build_feature_matrix(
+            dlc_df, ann_df, speed, w,
+            label_col=args.label_col,
+            dlc_conf_thr=args.dlc_conf_thr,
+            smooth_label_win=args.smooth_label_win,
+        )
+        print(f"[Data] T={len(X)} F={X.shape[1]} valid_frames={mask.sum()}")
+        session_data = [{
+            "session_prefix": args.session_prefix,
+            "X": X, "y": y, "mask": mask,
+            "feat_names": feat_names, "fps": fps, "mat_name": mat_name,
+        }]
+
+    # Validate features
+    n_features = session_data[0]["X"].shape[1]
+    feat_names = session_data[0]["feat_names"]
+    for sess in session_data[1:]:
+        if sess["X"].shape[1] != n_features:
+            raise ValueError(
+                f"Feature mismatch: {sess['session_prefix']} has "
+                f"{sess['X'].shape[1]} features, expected {n_features}."
+            )
+
+    # =============================================
+    # Train or sweep
+    # =============================================
+    if args.sweep:
+        run_sweep(session_data, n_features, feat_names, args)
+    else:
+        result = train_one_config(
+            session_data, n_features, feat_names, args, verbose=True,
+        )
+        print(f"\n[Done] best val_loss={result['best_val_loss']:.4f} "
+              f"@ epoch {result['best_epoch']}/{result['total_epochs']} "
+              f"| {result['n_params']:,} params")
+
+        # Save training curve
+        curve_path = Path(args.out_ckpt).with_suffix(".curve.csv")
+        with open(curve_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch", "train_loss", "val_loss", "lr"])
+            for row in result["train_curve"]:
+                w.writerow(row)
+        print(f"[Curve] {curve_path}")
 
 
 if __name__ == "__main__":
