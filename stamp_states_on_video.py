@@ -294,6 +294,8 @@ def annotate_video(
 
             # White text on top
             cv2.putText(
+
+
                 frame,
                 text,
                 (x0 + 5, y0 + text_h + 2),

@@ -65,6 +65,57 @@ CLASSES = [0, 1, 2, 3, 4, 5]
 # ============================================================
 # Utilities
 # ============================================================
+def enforce_stillness_by_speed(y: np.ndarray, speed: np.ndarray,
+                               threshold: float = 0.1,
+                               min_duration: int = 30,
+                               still_label: int = 2) -> np.ndarray:
+    """
+    Overrides human_labeled_state to 'still' (default 2) ONLY if the speed 
+    remains below the threshold for a continuous sequence longer than min_duration.
+
+    Args:
+        y: The state label array.
+        speed: The speed array (cm/s).
+        threshold: Speed cutoff (default 0.1).
+        min_duration: Minimum consecutive frames required to trigger the override (default 30).
+        still_label: The integer label for 'still' (default 2).
+    """
+    # 1. Ensure lengths match
+    n = min(len(y), len(speed))
+    y = y[:n]
+    speed = speed[:n]
+
+    # 2. create a boolean mask where speed is low
+    low_speed_mask = (speed < threshold)
+
+    # 3. Find runs (start and end indices) of low speed
+    # Padding with False ensures we detect runs at the very start or end of the array
+    padded = np.concatenate(([False], low_speed_mask, [False]))
+    # diff gives 1 at start of run, -1 at end of run
+    diffs = np.diff(padded.astype(int))
+
+    starts = np.where(diffs == 1)[0]
+    ends = np.where(diffs == -1)[0]
+
+    frames_modified = 0
+
+    # 4. Iterate through runs and apply correction if length > min_duration
+    for start, end in zip(starts, ends):
+        run_length = end - start
+        if run_length > min_duration:
+            # Count how many we are actually changing (for logging)
+            current_labels = y[start:end]
+            frames_modified += np.sum(current_labels != still_label)
+
+            # Force to still
+            y[start:end] = still_label
+
+    if frames_modified > 0:
+        print(f"  [LABEL] Enforced stillness (speed < {threshold} for > {min_duration} frames) "
+              f"on {frames_modified} frames.")
+
+    return y
+
 
 def ensure_dir(p: str | Path) -> Path:
     p = Path(p)
