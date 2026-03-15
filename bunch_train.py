@@ -1,32 +1,17 @@
 #!/usr/bin/env python3
 """
-train.py — Multi-session TCN trainer v3 (egocentric features)
+train.py — Multi-session TCN trainer v3.1 (egocentric features, 5 classes)
 
-Key changes vs v2:
-  - EGOCENTRIC FEATURES: bodypart positions are now relative to the body
-    centroid, eliminating dependence on absolute arena position. This is
-    critical for cross-session generalization.
-  - POSTURE FEATURES: inter-bodypart distances (body length, head width)
-    and body angle encode posture in a position/rotation-invariant way.
-  - CENTROID VELOCITY: captures overall locomotion direction.
-  - TRAINING AUGMENTATION: optional Gaussian noise (--augment) to further
-    reduce overfitting to session-specific patterns.
-  - Absolute centroid x/y from MoSeq is EXCLUDED (position-dependent).
+Changes vs v3:
+  - MERGED explore (old 3) into forward (old 1) → single "forward/explore" class
+  - Now 5 classes: turn(0), forward(1), still(2), rear(3), groom(4)
+  - Label remapping applied after loading, before any training
 
-Feature set per bodypart (4 features each):
-  {bp}_rx, {bp}_ry    — position relative to body centroid
-  {bp}_vx, {bp}_vy    — frame-to-frame velocity
-
-Global features:
-  centroid_vx/vy       — centroid velocity (locomotion direction)
-  p_mean, p_min        — DLC confidence
-  dist_*               — inter-bodypart distances (posture)
-  body_angle_sin/cos   — nose-to-tail orientation
-  syllable_id          — MoSeq syllable
-  latent_state 0-3     — MoSeq latents
-  heading              — MoSeq heading (position-invariant)
-  speed_cm_per_s       — from allTrackData
-  w_angvel             — angular velocity
+Key features (unchanged from v3):
+  - EGOCENTRIC FEATURES: bodypart positions relative to body centroid
+  - POSTURE FEATURES: inter-bodypart distances, body angle
+  - CENTROID VELOCITY, training augmentation
+  - Absolute centroid x/y from MoSeq EXCLUDED
 
 Usage:
   python train.py --data_dir data/ --combined_mat data/combined.mat \
@@ -55,15 +40,42 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from scipy.io import loadmat
 
 # ----------------------------
-# State mapping
+# State mapping (5 classes — explore merged into forward)
 # ----------------------------
+# Original labels in annotation CSVs:
+#   0=turn, 1=forward, 2=still, 3=explore, 4=rear, 5=groom, -1=unsigned
+#
+# After remapping:
+#   0=turn, 1=forward/explore, 2=still, 3=rear, 4=groom
+ORIGINAL_TO_NEW = {
+    0: 0,   # turn → turn
+    1: 1,   # forward → forward
+    2: 2,   # still → still
+    3: 1,   # explore → forward (MERGED)
+    4: 3,   # rear → rear
+    5: 4,   # groom → groom
+    -1: -1, # unsigned stays unsigned
+}
+
 STATE_MAP = {
-    0: "turn", 1: "forward", 2: "still",
-    3: "explore", 4: "rear", 5: "groom",
+    0: "turn",
+    1: "forward",  # includes old "explore"
+    2: "still",
+    3: "rear",
+    4: "groom",
     -1: "unsigned",
 }
-VALID_CLASSES = [0, 1, 2, 3, 4, 5]
+VALID_CLASSES = [0, 1, 2, 3, 4]
 N_CLASSES = len(VALID_CLASSES)
+
+
+def remap_labels(y: np.ndarray) -> np.ndarray:
+    """Remap original 6-class labels to 5-class scheme (explore→forward)."""
+    y_new = y.copy()
+    for old_val, new_val in ORIGINAL_TO_NEW.items():
+        y_new[y == old_val] = new_val
+    return y_new
+
 
 # ============================================================
 # Model
@@ -91,7 +103,7 @@ class TCNBlock(nn.Module):
 
 
 class TCN(nn.Module):
-    def __init__(self, in_features, n_classes=6, channels=32, levels=8,
+    def __init__(self, in_features, n_classes=5, channels=32, levels=8,
                  kernel_size=5, dropout=0.25):
         super().__init__()
         self.in_proj = nn.Conv1d(in_features, channels, kernel_size=1)
@@ -118,53 +130,30 @@ def enforce_stillness_by_speed(y: np.ndarray, speed: np.ndarray,
                                min_duration: int = 30,
                                still_label: int = 2) -> np.ndarray:
     """
-    Overrides human_labeled_state to 'still' (default 2) ONLY if the speed
-    remains below the threshold for a continuous sequence longer than min_duration.
-
-    Args:
-        y: The state label array.
-        speed: The speed array (cm/s).
-        threshold: Speed cutoff (default 0.1).
-        min_duration: Minimum consecutive frames required to trigger the override (default 30).
-        still_label: The integer label for 'still' (default 2).
+    Overrides label to 'still' if speed stays below threshold for > min_duration frames.
     """
-    # 1. Ensure lengths match
     n = min(len(y), len(speed))
     y = y[:n]
     speed = speed[:n]
 
-    # 2. create a boolean mask where speed is low
     low_speed_mask = (speed < threshold)
-
-    # 3. Find runs (start and end indices) of low speed
-    # Padding with False ensures we detect runs at the very start or end of the array
     padded = np.concatenate(([False], low_speed_mask, [False]))
-    # diff gives 1 at start of run, -1 at end of run
     diffs = np.diff(padded.astype(int))
-
     starts = np.where(diffs == 1)[0]
     ends = np.where(diffs == -1)[0]
 
     frames_modified = 0
-
-    # 4. Iterate through runs and apply correction if length > min_duration
     for start, end in zip(starts, ends):
         run_length = end - start
         if run_length > min_duration:
-            # Count how many we are actually changing (for logging)
             current_labels = y[start:end]
             frames_modified += np.sum(current_labels != still_label)
-
-            # Force to still
             y[start:end] = still_label
 
     if frames_modified > 0:
         print(f"  [LABEL] Enforced stillness (speed < {threshold} for > {min_duration} frames) "
               f"on {frames_modified} frames.")
-
     return y
-
-
 
 
 # ============================================================
@@ -173,15 +162,7 @@ def enforce_stillness_by_speed(y: np.ndarray, speed: np.ndarray,
 
 def compute_class_weights(session_data: List[Dict], indices: List[int] = None,
                           n_classes: int = N_CLASSES) -> torch.Tensor:
-    """
-    Compute class weights using sqrt of inverse frequency.
-
-    Raw inverse-frequency weights over-compensate for rare classes (like
-    'still' with ~400 frames), causing massive over-prediction. Sqrt
-    scaling provides a gentler boost:
-      raw inverse:  still ≈ 8x, explore ≈ 0.5x  → too aggressive
-      sqrt inverse: still ≈ 2.8x, explore ≈ 0.7x → balanced
-    """
+    """Sqrt inverse-frequency class weights."""
     if indices is None:
         indices = list(range(len(session_data)))
     counts = np.zeros(n_classes, dtype=np.float64)
@@ -191,12 +172,9 @@ def compute_class_weights(session_data: List[Dict], indices: List[int] = None,
         for c in range(n_classes):
             counts[c] += ((y == c) & mask).sum()
     total = counts.sum()
-    # sqrt of inverse frequency, normalized to sum to n_classes
     raw_weights = np.where(counts > 0, total / (n_classes * counts), 1.0)
     weights = np.sqrt(raw_weights)
-    # Re-normalize so weights sum to n_classes (preserves loss scale)
     weights = weights * (n_classes / weights.sum())
-    # Clamp to prevent any extreme values
     weights = np.clip(weights, 0.5, 3.0)
     return torch.tensor(weights, dtype=torch.float32)
 
@@ -320,11 +298,9 @@ def load_kinematics_from_combined_mat(mat_path: str, session_prefix: str):
 
 
 def _find_bodypart(bodyparts: List[str], candidates: List[str]) -> Optional[str]:
-    """Find a bodypart name from a list of possible names."""
     for c in candidates:
         if c in bodyparts:
             return c
-        # Try case-insensitive
         for bp in bodyparts:
             if bp.lower() == c.lower():
                 return bp
@@ -344,19 +320,7 @@ def build_feature_matrix(
     include_latents: bool = True,
     include_centroid_heading: bool = True,
 ):
-    """
-    Build EGOCENTRIC feature matrix.
-
-    All bodypart positions are relative to the body centroid (mean of all
-    tracked bodyparts). This eliminates dependence on absolute arena
-    position, which is the primary source of cross-session generalization
-    failure.
-
-    Additional posture features:
-      - Inter-bodypart distances (body length, head width, etc.)
-      - Body orientation angle (nose-to-tail direction, sin/cos encoded)
-      - Centroid velocity (locomotion direction)
-    """
+    """Build EGOCENTRIC feature matrix. Labels are remapped to 5 classes."""
     T = min(len(dlc_df), len(ann_df), len(speed), len(angvel), len(kin_valid))
     dlc_df = dlc_df.iloc[:T]
     ann_df = ann_df.iloc[:T]
@@ -367,12 +331,9 @@ def build_feature_matrix(
     bodyparts = sorted(set([c[1] for c in dlc_df.columns]))
     bodyparts = [bp for bp in bodyparts if bp not in ("bodyparts", "coords")]
 
-    # =========================================================
     # Step 1: Extract all bodypart positions & confidences
-    # =========================================================
-    bp_xy = {}      # {name: (T, 2) float32}
-    bp_conf = {}    # {name: (T,) float32}
-
+    bp_xy = {}
+    bp_conf = {}
     for bp in bodyparts:
         x = dlc_df.xs((bp, "x"), level=(1, 2), axis=1).to_numpy().squeeze()
         y = dlc_df.xs((bp, "y"), level=(1, 2), axis=1).to_numpy().squeeze()
@@ -382,62 +343,45 @@ def build_feature_matrix(
         bp_xy[bp] = xy
         bp_conf[bp] = p
 
-    # =========================================================
-    # Step 2: Body reference point = "neck" bodypart
-    # =========================================================
+    # Step 2: Body reference point
     bp_neck = _find_bodypart(bodyparts, ["neck", "Neck", "neck_base"])
     if bp_neck is None:
-        print(f"  [FEAT WARN] 'neck' not found in bodyparts: {bodyparts}")
-        print(f"  [FEAT WARN] Falling back to mean of all bodyparts as centroid")
-        all_xy = np.stack(list(bp_xy.values()), axis=1)  # (T, N_bp, 2)
-        centroid = np.nanmean(all_xy, axis=1)  # (T, 2)
+        print(f"  [FEAT WARN] 'neck' not found, using mean of all bodyparts")
+        all_xy = np.stack(list(bp_xy.values()), axis=1)
+        centroid = np.nanmean(all_xy, axis=1)
     else:
-        centroid = bp_xy[bp_neck].copy()  # (T, 2)
+        centroid = bp_xy[bp_neck].copy()
         print(f"  [FEAT] Using '{bp_neck}' as body reference point")
 
-    # Fill any remaining NaN in centroid (edge case)
     for j in range(2):
         s = pd.Series(centroid[:, j])
         centroid[:, j] = s.interpolate(limit_direction="both").to_numpy(dtype=np.float32)
 
-    # =========================================================
     # Step 3: Egocentric features per bodypart
-    # =========================================================
     feats = []
     feat_names = []
-
     for bp in bodyparts:
         xy = bp_xy[bp]
-        # Relative position (centroid-subtracted)
         rel_xy = (xy - centroid).astype(np.float32)
-        # Velocity (already shift-invariant)
         vel = compute_velocity(xy)
-
         feats.append(rel_xy)
         feat_names += [f"{bp}_rx", f"{bp}_ry"]
         feats.append(vel)
         feat_names += [f"{bp}_vx", f"{bp}_vy"]
 
-    # =========================================================
-    # Step 4: Centroid velocity (locomotion direction & speed)
-    # =========================================================
+    # Step 4: Centroid velocity
     centroid_vel = compute_velocity(centroid)
     feats.append(centroid_vel)
     feat_names += ["centroid_vx", "centroid_vy"]
 
-    # =========================================================
-    # Step 5: Confidence features
-    # =========================================================
-    conf_mat = np.stack(list(bp_conf.values()), axis=1)  # (T, N_bp)
+    # Step 5: Confidence
+    conf_mat = np.stack(list(bp_conf.values()), axis=1)
     feats.append(np.mean(conf_mat, axis=1, keepdims=True))
     feat_names += ["p_mean"]
     feats.append(np.min(conf_mat, axis=1, keepdims=True))
     feat_names += ["p_min"]
 
-    # =========================================================
-    # Step 6: Inter-bodypart distances (posture features)
-    # =========================================================
-    # Try common DLC bodypart name variants
+    # Step 6: Posture distances
     bp_nose = _find_bodypart(bodyparts, ["nose", "snout", "Nose"])
     bp_tail = _find_bodypart(bodyparts, ["tail_base", "tailbase", "tail_start", "Tail_base"])
     bp_left_ear = _find_bodypart(bodyparts, ["left_ear", "leftear", "Left_ear", "ear_left"])
@@ -459,30 +403,18 @@ def build_feature_matrix(
         feats.append(dist)
         feat_names += [f"dist_{name}"]
 
-    n_posture = len(posture_pairs)
-    print(f"  [FEAT] {len(bodyparts)} bodyparts, {n_posture} posture distances")
-    if posture_pairs:
-        print(f"         distances: {[name for _, _, name in posture_pairs]}")
+    print(f"  [FEAT] {len(bodyparts)} bodyparts, {len(posture_pairs)} posture distances")
 
-    # =========================================================
-    # Step 7: Body orientation angle (nose → tail direction)
-    # =========================================================
+    # Step 7: Body orientation
     if bp_nose and bp_tail:
         diff = bp_xy[bp_nose] - bp_xy[bp_tail]
-        angle = np.arctan2(diff[:, 1], diff[:, 0])  # (T,)
+        angle = np.arctan2(diff[:, 1], diff[:, 0])
         feats.append(np.sin(angle).reshape(-1, 1).astype(np.float32))
         feat_names += ["body_angle_sin"]
         feats.append(np.cos(angle).reshape(-1, 1).astype(np.float32))
         feat_names += ["body_angle_cos"]
-        print(f"  [FEAT] body_angle from {bp_nose} → {bp_tail}")
-    else:
-        avail = [bp_nose, bp_tail, bp_left_ear, bp_right_ear]
-        print(f"  [FEAT WARN] Could not compute body_angle. "
-              f"Found: nose={bp_nose}, tail={bp_tail}")
 
-    # =========================================================
-    # Step 8: MoSeq features (EXCLUDING absolute centroid x/y)
-    # =========================================================
+    # Step 8: MoSeq (excluding centroid x/y)
     if include_moseq and ("syllable" in ann_df.columns):
         feats.append(ann_df["syllable"].to_numpy(dtype=np.float32).reshape(-1, 1))
         feat_names += ["syllable_id"]
@@ -494,36 +426,31 @@ def build_feature_matrix(
                 feats.append(ann_df[col].to_numpy(dtype=np.float32).reshape(-1, 1))
                 feat_names += [col]
 
-    # heading is an angle (position-invariant) — KEEP
-    # centroid x/y are absolute positions — EXCLUDED
     if include_centroid_heading and ("heading" in ann_df.columns):
         feats.append(ann_df["heading"].to_numpy(dtype=np.float32).reshape(-1, 1))
         feat_names += ["heading"]
-    # NOTE: "centroid x" and "centroid y" intentionally excluded —
-    # they encode absolute arena position and hurt cross-session transfer.
 
-    # =========================================================
-    # Step 9: Kinematics from allTrackData
-    # =========================================================
+    # Step 9: Kinematics
     feats.append(speed.reshape(-1, 1))
     feat_names += ["speed_cm_per_s"]
     feats.append(angvel.reshape(-1, 1))
     feat_names += ["w_angvel"]
 
-    # =========================================================
     # Assemble
-    # =========================================================
     X = np.concatenate(feats, axis=1).astype(np.float32)
-
-    # Replace any remaining NaN/Inf with 0 (safety net)
     nan_count = np.isnan(X).sum() + np.isinf(X).sum()
     if nan_count > 0:
-        print(f"  [FEAT WARN] {nan_count} NaN/Inf values in features — replacing with 0")
+        print(f"  [FEAT WARN] {nan_count} NaN/Inf values — replacing with 0")
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # --- Labels: smooth FIRST (on original 6-class), THEN remap to 5-class ---
     y_arr = ann_df[label_col].to_numpy(dtype=np.int64)[:T]
     if smooth_label_win is not None and smooth_label_win >= 3:
         y_arr = window_majority_labels(y_arr, win=smooth_label_win, ignore_label=-1)
+
+    # Remap: explore(3) → forward(1), rear(4)→3, groom(5)→4
+    y_arr = remap_labels(y_arr)
+    print(f"  [LABEL] Remapped to 5 classes (explore→forward)")
 
     y_arr = enforce_stillness_by_speed(y_arr, speed, threshold=0.2, still_label=2)
 
@@ -535,9 +462,7 @@ def build_feature_matrix(
         print(f"  [MASK] {n_kin_masked} additional frames masked due to NaN kinematics "
               f"(total valid: {mask.sum()}/{T})")
 
-    print(f"  [FEAT] Total features: {X.shape[1]}  "
-          f"(was ~56 with absolute coords, now egocentric)")
-
+    print(f"  [FEAT] Total features: {X.shape[1]}")
     return X, y_arr, mask, feat_names
 
 
@@ -639,7 +564,6 @@ def load_all_sessions(sessions, combined_mat, label_col, dlc_conf_thr, smooth_la
         except Exception as e:
             print(f"  [ERROR] Failed to load kinematics: {e}"); continue
 
-        # Dimension diagnostic
         lens = {"dlc_h5": len(dlc_df), "ann_csv": len(ann_df),
                 "speed": len(speed), "w": len(w)}
         print(f"  [DIM] " + "  ".join(f"{k}={v}" for k, v in lens.items()))
@@ -652,7 +576,9 @@ def load_all_sessions(sessions, combined_mat, label_col, dlc_conf_thr, smooth_la
             smooth_label_win=smooth_label_win,
         )
         print(f"  T={len(X)}, F={X.shape[1]}, valid_frames={mask.sum()}, fps={fps}")
-        print(f"  Label counts: {dict(zip(*np.unique(y[mask], return_counts=True)))}")
+        label_counts = dict(zip(*np.unique(y[mask], return_counts=True)))
+        label_str = {STATE_MAP.get(k, f"?{k}"): v for k, v in label_counts.items()}
+        print(f"  Label counts (5-class): {label_str}")
 
         loaded.append({
             "session_prefix": prefix, "X": X, "y": y, "mask": mask,
@@ -665,7 +591,7 @@ def load_all_sessions(sessions, combined_mat, label_col, dlc_conf_thr, smooth_la
 
 
 # ============================================================
-# Dataset (with optional training augmentation)
+# Dataset
 # ============================================================
 class SequenceDataset(Dataset):
     def __init__(self, X, y, mask, seq_len=256, stride=128,
@@ -690,7 +616,6 @@ class SequenceDataset(Dataset):
         a, b = self.indices[i]
         x = torch.from_numpy(self.X[a:b])
         if self.augment:
-            # Small Gaussian noise helps generalization across sessions
             x = x + torch.randn_like(x) * self.noise_std
         return (
             x,
@@ -745,11 +670,10 @@ def train_one_config(
         "channels": channels, "levels": levels, "kernel_size": kernel_size,
         "dropout": dropout, "lr": lr, "tv_weight": tv_weight,
         "seq_len": seq_len, "stride": stride, "loss": args.loss,
-        "augment": args.augment,
+        "augment": args.augment, "n_classes": N_CLASSES,
     }
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- Determine train/val split ---
     if train_indices is not None and val_indices is not None:
         train_idx = train_indices
         val_idx = val_indices
@@ -762,7 +686,6 @@ def train_one_config(
     else:
         train_idx = val_idx = None
 
-    # --- Normalization from train data only ---
     if train_idx is not None:
         X_train_all = np.concatenate([session_data[i]["X"] for i in train_idx], axis=0)
     else:
@@ -774,7 +697,6 @@ def train_one_config(
     norm_mean, norm_std = compute_norm_stats(X_train_all)
     del X_train_all
 
-    # --- Build datasets ---
     augment = args.augment
     if train_idx is not None:
         train_datasets, val_datasets = [], []
@@ -800,14 +722,12 @@ def train_one_config(
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
-    # --- Class weights ---
     cw = compute_class_weights(session_data, train_idx)
     cw_device = cw.to(device)
     if verbose:
         cw_str = "  ".join(f"{STATE_MAP[i]}={cw[i]:.2f}" for i in range(N_CLASSES))
         print(f"[ClassWeights] {cw_str}")
 
-    # --- Loss function ---
     if args.loss == "focal":
         loss_fn = lambda logits, y, mask: masked_focal_loss(
             logits, y, mask, class_weights=cw_device, gamma=args.focal_gamma)
@@ -815,7 +735,6 @@ def train_one_config(
         loss_fn = lambda logits, y, mask: masked_ce_loss(
             logits, y, mask, class_weights=cw_device)
 
-    # --- Model ---
     model = TCN(
         in_features=n_features, n_classes=N_CLASSES,
         channels=channels, levels=levels,
@@ -826,7 +745,8 @@ def train_one_config(
     if verbose:
         print(f"\n{'='*60}")
         print(f"[Config] ch={channels} lv={levels} ks={kernel_size} "
-              f"do={dropout} lr={lr} tv={tv_weight} loss={args.loss} aug={augment}")
+              f"do={dropout} lr={lr} tv={tv_weight} loss={args.loss} "
+              f"aug={augment} classes={N_CLASSES}")
         print(f"[Model]  {n_params:,} parameters")
         print(f"[Data]   Train chunks: {len(train_ds)}, Val chunks: {len(val_ds)}")
         if train_idx is not None:
@@ -849,7 +769,6 @@ def train_one_config(
             losses.append(loss.item())
         return float(np.mean(losses)) if losses else float("inf")
 
-    # --- Training loop ---
     best_val = float("inf")
     best_epoch = 0
     patience_counter = 0
@@ -904,7 +823,10 @@ def train_one_config(
                 "best_epoch": int(best_epoch),
                 "config": config,
                 "class_weights": cw.numpy(),
-                "feature_version": "egocentric_v3",
+                "feature_version": "egocentric_v3.1_5class",
+                "n_classes": N_CLASSES,
+                "state_map": STATE_MAP,
+                "label_remap": ORIGINAL_TO_NEW,
             }
             torch.save(ckpt, out_ckpt)
             if verbose:
@@ -939,7 +861,8 @@ def run_loso(session_data, n_features, feat_names, args):
     loso_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'#'*60}")
-    print(f"[LOSO] {n}-fold cross-validation ({n} sessions)")
+    print(f"[LOSO] {n}-fold CV ({n} sessions), {N_CLASSES} classes")
+    print(f"[LOSO] Classes: {STATE_MAP}")
     print(f"[LOSO] Results -> {loso_dir}")
     print(f"{'#'*60}")
 
@@ -967,7 +890,6 @@ def run_loso(session_data, n_features, feat_names, args):
         result["held_out"] = val_prefix
         fold_results.append(result)
 
-        # --- Evaluate on held-out session ---
         device = "cuda" if torch.cuda.is_available() else "cpu"
         ckpt = torch.load(fold_ckpt, map_location=device, weights_only=False)
         model = TCN(
@@ -1005,13 +927,13 @@ def run_loso(session_data, n_features, feat_names, args):
             print(f"  {STATE_MAP[c]:>10s}  P={p:.2f}  R={r:.2f}  F1={f1:.2f}  n={n_gt}")
         result["accuracy"] = float(acc)
 
-    # --- Aggregate ---
+    # Aggregate
     all_gt = np.concatenate(all_gt)
     all_preds = np.concatenate(all_preds)
     overall_acc = (all_gt == all_preds).mean()
 
     print(f"\n{'#'*60}")
-    print(f"[LOSO AGGREGATE] Pooled across all {n} held-out sessions")
+    print(f"[LOSO AGGREGATE] {N_CLASSES}-class, pooled across {n} sessions")
     print(f"  Overall accuracy: {overall_acc:.3f}")
 
     macro_f1s = []
@@ -1033,7 +955,6 @@ def run_loso(session_data, n_features, feat_names, args):
     print(f"  {'macro_F1':>10s}  = {macro_f1:.3f}")
     print(f"{'#'*60}")
 
-    # Save CSVs
     summary_path = loso_dir / "loso_summary.csv"
     with open(summary_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["fold", "held_out", "accuracy",
@@ -1054,8 +975,7 @@ def run_loso(session_data, n_features, feat_names, args):
     print(f"\n[LOSO] Saved: {summary_path}")
     print(f"[LOSO] Saved: {per_class_path}")
 
-    # Train final model on all sessions
-    print(f"\n[LOSO] Training final model on all {n} sessions for deployment...")
+    print(f"\n[LOSO] Training final model on all {n} sessions...")
     final_result = train_one_config(
         session_data, n_features, feat_names, args,
         out_ckpt=args.out_ckpt, verbose=True,
@@ -1096,7 +1016,7 @@ def run_sweep(session_data, n_features, feat_names, args):
     sweep_log_path = sweep_dir / "sweep_results.csv"
 
     print(f"\n{'#'*60}")
-    print(f"[SWEEP] {n_configs} configurations to evaluate")
+    print(f"[SWEEP] {n_configs} configs, {N_CLASSES} classes")
     print(f"{'#'*60}")
 
     results = []
@@ -1119,8 +1039,6 @@ def run_sweep(session_data, n_features, feat_names, args):
             result["tag"] = tag
             result["elapsed_s"] = elapsed
             results.append(result)
-            print(f"[SWEEP {i}/{n_configs}] best_val={result['best_val_loss']:.4f} "
-                  f"@ ep {result['best_epoch']} | {result['n_params']:,} params | {elapsed:.0f}s")
         except Exception as e:
             print(f"[SWEEP {i}/{n_configs}] FAILED: {e}")
             results.append({"tag": tag, "config": cfg, "best_val_loss": float("inf"),
@@ -1159,16 +1077,6 @@ def run_sweep(session_data, n_features, feat_names, args):
             print(f"  val_loss={best['best_val_loss']:.4f} | config={best['config']}")
             print(f"  Saved to: {args.out_ckpt}")
             print(f"{'='*60}")
-
-        for r in sorted(valid, key=lambda r: r["best_val_loss"])[:5]:
-            curve = r.get("train_curve", [])
-            if curve:
-                curve_path = sweep_dir / f"curve_{r['tag']}.csv"
-                with open(curve_path, "w", newline="") as f:
-                    w = csv.writer(f)
-                    w.writerow(["epoch", "train_loss", "val_loss", "lr"])
-                    for row in curve:
-                        w.writerow(row)
     return results
 
 
@@ -1177,9 +1085,8 @@ def run_sweep(session_data, n_features, feat_names, args):
 # ============================================================
 def main():
     ap = argparse.ArgumentParser(
-        description="Train TCN for mouse behavior (egocentric features v3).")
+        description="Train TCN for mouse behavior (egocentric v3.1, 5 classes).")
 
-    # Input
     ap.add_argument("--dlc_h5", default=None)
     ap.add_argument("--ann_csv", default=None)
     ap.add_argument("--session_prefix", default=None)
@@ -1188,46 +1095,38 @@ def main():
     ap.add_argument("--label_col", default="human_labeled_state")
     ap.add_argument("--out_ckpt", required=True)
 
-    # Split
     ap.add_argument("--split_mode", choices=["temporal", "session", "loso"],
                     default="temporal")
     ap.add_argument("--val_fraction", type=float, default=0.2)
 
-    # Preprocessing
     ap.add_argument("--dlc_conf_thr", type=float, default=0.8)
     ap.add_argument("--smooth_label_win", type=int, default=9)
 
-    # Training
     ap.add_argument("--seq_len", type=int, default=384)
     ap.add_argument("--stride", type=int, default=384)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--patience", type=int, default=60)
-    ap.add_argument("--augment", action="store_true",
-                    help="Add Gaussian noise augmentation during training.")
+    ap.add_argument("--augment", action="store_true")
 
-    # Model
     ap.add_argument("--channels", type=int, default=32)
     ap.add_argument("--levels", type=int, default=6)
     ap.add_argument("--kernel_size", type=int, default=5)
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--tv_weight", type=float, default=0.04)
 
-    # Loss
     ap.add_argument("--loss", choices=["ce", "focal"], default="ce")
     ap.add_argument("--focal_gamma", type=float, default=2.0)
 
-    # Sweep
     ap.add_argument("--sweep", action="store_true")
 
     args = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Device] {device}")
-    print(f"[Features] EGOCENTRIC v3 — centroid-relative positions, "
-          f"posture distances, body angle")
+    print(f"[Features] EGOCENTRIC v3.1 — {N_CLASSES} classes (explore merged into forward)")
+    print(f"[Classes] {STATE_MAP}")
 
-    # --- Load data ---
     if args.data_dir is not None:
         if args.combined_mat is None:
             mat_files = list(Path(args.data_dir).glob("*.mat"))
@@ -1256,18 +1155,15 @@ def main():
         ann_df = pd.read_csv(args.ann_csv)
         speed, w, kin_valid, fps, mat_name = load_kinematics_from_combined_mat(
             args.combined_mat, args.session_prefix)
-        print(f"[MAT] matched: {mat_name} | fps={fps}")
         X, y, mask, feat_names = build_feature_matrix(
             dlc_df, ann_df, speed, w, kin_valid,
             label_col=args.label_col, dlc_conf_thr=args.dlc_conf_thr,
             smooth_label_win=args.smooth_label_win,
         )
-        print(f"[Data] T={len(X)} F={X.shape[1]} valid_frames={mask.sum()}")
         session_data = [{"session_prefix": args.session_prefix, "X": X, "y": y,
                          "mask": mask, "feat_names": feat_names, "fps": fps,
                          "mat_name": mat_name}]
 
-    # Validate features
     n_features = session_data[0]["X"].shape[1]
     feat_names = session_data[0]["feat_names"]
     for sess in session_data[1:]:
@@ -1277,7 +1173,6 @@ def main():
 
     print(f"\n[Features] {n_features} features: {feat_names[:6]} ... {feat_names[-4:]}")
 
-    # --- Run ---
     if args.sweep:
         run_sweep(session_data, n_features, feat_names, args)
     elif args.split_mode == "loso":
